@@ -1,0 +1,161 @@
+<?xml version='1.0'?>
+<robot name="my_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:include filename="$(find erc_sor_ros_session1)/urdf/materials.xacro"/>
+  <xacro:include filename="$(find erc_sor_ros_session1)/urdf/sor_bot.gazebo"/>
+
+  <xacro:macro name="box_inertia" params="m l w h">
+    <inertia ixx="${(m*(w*w+h*h))/12}" ixy="0" ixz="0"
+             iyy="${(m*(l*l+h*h))/12}" iyz="0"
+             izz="${(m*(l*l+w*w))/12}"/>
+  </xacro:macro>
+
+  <xacro:macro name="cylinder_inertia" params="m r h">
+    <inertia ixx="${(m*(3*r*r+h*h))/12}" ixy="0" ixz="0"
+             iyy="${(m*(3*r*r+h*h))/12}" iyz="0"
+             izz="${(m*r*r)/2}"/>
+  </xacro:macro>
+
+  <xacro:macro name="sphere_inertia" params="m r">
+    <inertia ixx="${(2*m*r*r)/5}" ixy="0" ixz="0"
+             iyy="${(2*m*r*r)/5}" iyz="0"
+             izz="${(2*m*r*r)/5}"/>
+  </xacro:macro>
+
+  <!-- ==================== BASE ==================== -->
+
+  <link name="base_footprint"/>
+
+  <joint name="base_footprint_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="base_footprint"/>
+    <child  link="base_link"/>
+  </joint>
+
+  <link name="base_link">
+    <pose>0 0 0.1 0 0 0</pose>
+    <inertial>
+      <mass value="15.0"/>
+      <origin xyz="0.0 0 0" rpy="0 0 0"/>
+      <xacro:box_inertia m="15.0" l="0.4" w="0.2" h="0.1"/>
+    </inertial>
+    <collision name="collision">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size=".4 .2 .1"/></geometry>
+    </collision>
+    <visual name="base_link_visual">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size=".4 .2 .1"/></geometry>
+      <material name="orange"/>
+    </visual>
+  </link>
+
+  <!-- ==================== WHEELS (4-wheel skid-steer) ==================== -->
+
+  <xacro:macro name="wheel" params="prefix x_pos y_pos">
+    <joint type="continuous" name="${prefix}_wheel_joint">
+      <origin xyz="${x_pos} ${y_pos} 0" rpy="0 0 0"/>
+      <child  link="${prefix}_wheel"/>
+      <parent link="base_link"/>
+      <axis xyz="0 1 0" rpy="0 0 0"/>
+      <limit effort="100" velocity="10"/>
+      <dynamics damping="1.0" friction="1.0"/>
+    </joint>
+    <link name="${prefix}_wheel">
+      <inertial>
+        <mass value="5.0"/>
+        <origin xyz="0 0 0" rpy="0 1.5707 1.5707"/>
+        <xacro:cylinder_inertia m="5.0" r="0.1" h="0.05"/>
+      </inertial>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 1.5707 1.5707"/>
+        <geometry><cylinder radius=".1" length=".05"/></geometry>
+      </collision>
+      <visual name="${prefix}_wheel_visual">
+        <origin xyz="0 0 0" rpy="0 1.5707 1.5707"/>
+        <geometry><cylinder radius=".1" length=".05"/></geometry>
+        <material name="green"/>
+      </visual>
+    </link>
+  </xacro:macro>
+
+  <xacro:wheel prefix="front_left"  x_pos=" 0.15" y_pos=" 0.15"/>
+  <xacro:wheel prefix="front_right" x_pos=" 0.15" y_pos="-0.15"/>
+  <xacro:wheel prefix="rear_left"   x_pos="-0.15" y_pos=" 0.15"/>
+  <xacro:wheel prefix="rear_right"  x_pos="-0.15" y_pos="-0.15"/>
+
+  <!-- ==================== CAMERA ==================== -->
+
+  <joint type="fixed" name="camera_joint">
+    <origin xyz="0.225 0 0.075" rpy="0 0 0"/>
+    <child link="camera_link"/>
+    <parent link="base_link"/>
+    <axis xyz="0 1 0" />
+  </joint>
+
+  <link name='camera_link'>
+    <pose>0 0 0 0 0 0</pose>
+    <inertial>
+      <mass value="0.1"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="1e-6" ixy="0" ixz="0"
+               iyy="1e-6" iyz="0"
+               izz="1e-6"/>
+    </inertial>
+    <collision name='collision'>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size=".03 .03 .03"/></geometry>
+    </collision>
+    <visual name='camera_link_visual'>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size=".03 .03 .03"/></geometry>
+    </visual>
+  </link>
+
+  <!-- optical frame (ROS camera convention: x right, y down, z forward) -->
+  <joint type="fixed" name="camera_optical_joint">
+    <origin xyz="0 0 0" rpy="-1.5707 0 -1.5707"/>
+    <child link="camera_link_optical"/>
+    <parent link="camera_link"/>
+  </joint>
+
+  <link name="camera_link_optical"/>
+
+  <!-- ==================== 2D LIDAR ==================== -->
+
+  <joint type="fixed" name="scan_joint">
+    <origin xyz="0.0 0 0.15" rpy="0 0 0"/>
+    <child link="scan_link"/>
+    <parent link="base_link"/>
+    <axis xyz="0 1 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name='scan_link'>
+    <inertial>
+      <mass value="1e-5"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="1e-6" ixy="0" ixz="0"
+               iyy="1e-6" iyz="0"
+               izz="1e-6"/>
+    </inertial>
+    <collision name='collision'>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size=".06 .06 .06"/></geometry>
+    </collision>
+    <visual name='scan_link_visual'>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size=".06 .06 .06"/></geometry>
+    </visual>
+  </link>
+
+  <!-- ==================== IMU ==================== -->
+
+  <joint name="imu_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="base_link"/>
+    <child link="imu_link" />
+  </joint>
+
+  <link name="imu_link"/>
+
+</robot>
