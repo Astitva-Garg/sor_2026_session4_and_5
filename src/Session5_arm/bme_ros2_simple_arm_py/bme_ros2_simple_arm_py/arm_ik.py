@@ -1,46 +1,50 @@
 """
 Custom Inverse Kinematics node for mogi_arm (4-DOF).
 
-Kinematic chain (from URDF):
-  base_link
-    └─ shoulder_pan_joint  (z offset: +0.05 m, rotates about Z)  → θ1
-       └─ shoulder_lift_joint (z offset: +0.025 m, rotates about Y) → θ2
-          └─ elbow_joint      (z offset: +0.200 m, rotates about Y) → θ3
-             └─ wrist_joint   (z offset: +0.250 m, rotates about Y) → θ4
-                └─ end_effector_link (z offset: +0.175 m, fixed)
+Kinematic chain (from URDF) — all revolute joints rotate about Y axis
+except shoulder_pan which rotates about Z:
 
-Link lengths used in the planar IK:
-  L1 = 0.200  (upper arm:  shoulder_lift → elbow)
-  L2 = 0.250  (forearm:    elbow → wrist)
-  L3 = 0.175  (wrist → end_effector, fixed offset along wrist z-axis)
+  base_link (at world origin)
+    └─ shoulder_pan_joint   z=+0.050, rot Z  → θ1  (yaw/pan)
+       └─ shoulder_lift_joint z=+0.025, rot Y → θ2  (pitch up/down)
+          upper_arm_link length along local-Z = 0.200 m
+          └─ elbow_joint    z=+0.200, rot Y  → θ3
+             forearm_link length along local-Z = 0.250 m
+             └─ wrist_joint z=+0.250, rot Y  → θ4
+                wrist_link + gripper_base + end_effector
+                total fixed length along local-Z = 0.175 m  → L3
 
-Shoulder base height above base_link:
-  d0 = 0.05 + 0.025 = 0.075 m
+Because every joint rotates about Y, the arm lies in a vertical plane
+whose azimuth is set by θ1.  Within that plane the joint angles are
+PITCH angles — positive rotates the tip UPWARD (i.e. away from Z=0).
 
-IK derivation (4-DOF planar + pan):
-  Step 1 – Pan angle (θ1):
-      θ1 = atan2(y, x)
+Forward kinematics in the vertical plane (elevation angle convention):
+  Let φ2 = θ2,  φ3 = θ2+θ3,  φ4 = θ2+θ3+θ4
 
-  Step 2 – Planar reach and height:
-      r  = sqrt(x² + y²)          (horizontal distance from arm axis)
-      pz = z - d0                  (height above shoulder pivot)
+  horizontal reach from shoulder pivot:
+    r_fk = L1·cos(φ2) + L2·cos(φ3) + L3·cos(φ4)
 
-  Step 3 – Subtract wrist offset to find wrist position:
-      The wrist-to-EE vector is always along the wrist's local z-axis.
-      For a down-facing end-effector (wrist pointing straight up), that
-      direction is the same as the planar arm direction.
-      We assume the EE approaches from above (wrist angle keeps EE level),
-      so we subtract L3 from the vertical:
-          wz = pz - L3
-          wr = r
+  vertical rise from shoulder pivot:
+    z_fk = L1·sin(φ2) + L2·sin(φ3) + L3·sin(φ4)
 
-  Step 4 – 2R IK for shoulder_lift (θ2) and elbow (θ3):
-      D = (wr² + wz²) / (2·L1·L2)   via law of cosines
-      θ3 = atan2(±sqrt(1 - D²), D)  (elbow-up solution used)
-      θ2 = atan2(wz, wr) - atan2(L2·sin(θ3), L1 + L2·cos(θ3))
+  EE in base_link frame:
+    x = r_fk · cos(θ1)
+    y = r_fk · sin(θ1)
+    z = D0 + z_fk          where D0 = 0.075 m (shoulder pivot height)
 
-  Step 5 – Wrist angle (θ4) to keep end-effector level (pointing down):
-      θ4 = -(θ2 + θ3)
+Inverse kinematics:
+  1.  θ1 = atan2(y, x)
+  2.  r  = sqrt(x²+y²),   pz = z − D0
+  3.  Find wrist position by removing the L3 EE segment.
+      We want EE level (φ4 = 0, meaning wrist points horizontally),
+      so the L3 segment is purely horizontal:
+          wr = r  − L3        (wrist horizontal reach)
+          wz = pz             (wrist height = EE height for level EE)
+  4.  2-R planar IK on (wr, wz) with links L1, L2:
+          D  = (wr²+wz² − L1²−L2²) / (2·L1·L2)   [cosine rule]
+          θ3 = atan2(+sqrt(1−D²), D)               [elbow-up]
+          θ2 = atan2(wz, wr) − atan2(L2·sin θ3, L1+L2·cos θ3)
+  5.  θ4 = −(θ2+θ3)   → keeps EE horizontal (φ4 = 0)
 """
 
 import rclpy
@@ -49,65 +53,93 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 import math
 
-
-# ── Link lengths from URDF ──────────────────────────────────────────────────
-D0 = 0.075   # shoulder pivot height above base_link (0.05 + 0.025)
-L1 = 0.200   # upper arm length  (shoulder_lift → elbow)
-L2 = 0.250   # forearm length    (elbow → wrist)
-L3 = 0.175   # wrist → end_effector (fixed)
+# ── Link parameters from URDF ────────────────────────────────────────────────
+D0 = 0.075   # shoulder pivot height above base_link  (0.050 + 0.025)
+L1 = 0.200   # upper arm   (shoulder_lift_joint → elbow_joint)
+L2 = 0.250   # forearm     (elbow_joint → wrist_joint)
+L3 = 0.175   # wrist-to-EE (fixed, along local Z after wrist_joint)
 
 
 def solve_ik(x: float, y: float, z: float):
     """
-    Solve 4-DOF IK for target position (x, y, z) in base_link frame.
-    Returns (theta1, theta2, theta3, theta4) in radians, or None if unreachable.
-
-    Joint mapping:
-      theta1 → shoulder_pan_joint
-      theta2 → shoulder_lift_joint
-      theta3 → elbow_joint
-      theta4 → wrist_joint
+    Solve 4-DOF IK.  Returns (θ1,θ2,θ3,θ4) in radians, or None.
+    All angles are about the joint's local Y axis (except θ1 about Z).
     """
 
-    # Step 1: Pan (base rotation about Z)
+    # ── Step 1: pan angle ────────────────────────────────────────────────────
     theta1 = math.atan2(y, x)
 
-    # Step 2: Planar reach and height above shoulder pivot
+    # ── Step 2: horizontal reach and height above shoulder pivot ─────────────
     r  = math.sqrt(x**2 + y**2)
     pz = z - D0
 
-    # Step 3: Subtract wrist-to-EE offset (EE kept level, pointing upward)
-    wr = r
-    wz = pz - L3
+    # ── Step 3: wrist position (EE kept horizontal → L3 is horizontal) ───────
+    wr = r - L3      # horizontal reach to wrist joint
+    wz = pz          # wrist height equals EE height (EE level)
 
-    # Step 4: 2R planar IK
-    D = (wr**2 + wz**2) / (2.0 * L1 * L2)
+    print(f'  [IK] r={r:.3f}  pz={pz:.3f}  wr={wr:.3f}  wz={wz:.3f}')
+
+    # ── Step 4: 2-R IK ───────────────────────────────────────────────────────
+    dist2 = wr**2 + wz**2
+    D = (dist2 - L1**2 - L2**2) / (2.0 * L1 * L2)   # cosine rule
+
+    print(f'  [IK] dist={math.sqrt(dist2):.3f}  D={D:.4f}')
 
     if abs(D) > 1.0:
-        return None  # target unreachable
+        print(f'  [IK] Unreachable: |D|={abs(D):.3f} > 1')
+        return None
 
-    # Elbow-up solution
-    theta3 = math.atan2(math.sqrt(1.0 - D**2), D)
+    theta3 = math.atan2(math.sqrt(1.0 - D**2), D)   # elbow-up
 
-    # Shoulder lift
-    alpha = math.atan2(wz, wr)
-    beta  = math.atan2(L2 * math.sin(theta3), L1 + L2 * math.cos(theta3))
+    alpha  = math.atan2(wz, wr)
+    beta   = math.atan2(L2 * math.sin(theta3), L1 + L2 * math.cos(theta3))
     theta2 = alpha - beta
 
-    # Step 5: Wrist keeps EE horizontal (level)
+    # ── Step 5: wrist keeps EE level ─────────────────────────────────────────
     theta4 = -(theta2 + theta3)
 
-    # Clamp to joint limits from URDF
+    print(f'  [IK] θ1={math.degrees(theta1):+.1f}°  θ2={math.degrees(theta2):+.1f}°'
+          f'  θ3={math.degrees(theta3):+.1f}°  θ4={math.degrees(theta4):+.1f}°')
+
+    # ── Forward-kinematics verification ──────────────────────────────────────
+    phi2 = theta2
+    phi3 = theta2 + theta3
+    phi4 = theta2 + theta3 + theta4          # should be ≈ 0
+
+    r_fk  = L1*math.cos(phi2) + L2*math.cos(phi3) + L3*math.cos(phi4)
+    z_fk  = L1*math.sin(phi2) + L2*math.sin(phi3) + L3*math.sin(phi4)
+    ee_x  = r_fk * math.cos(theta1)
+    ee_y  = r_fk * math.sin(theta1)
+    ee_z  = D0 + z_fk
+    err   = math.sqrt((ee_x-x)**2 + (ee_y-y)**2 + (ee_z-z)**2)
+    print(f'  [FK]  EE=({ee_x:.3f}, {ee_y:.3f}, {ee_z:.3f})  '
+          f'target=({x:.3f}, {y:.3f}, {z:.3f})  err={err*1000:.1f} mm')
+
+    # ── Joint-limit check ─────────────────────────────────────────────────────
     limits = [
-        (-3.14,  3.14),   # shoulder_pan
-        (-1.5708, 1.5708), # shoulder_lift
-        (-2.3562, 2.3562), # elbow
-        (-2.3562, 2.3562), # wrist
+        (-3.14,   3.14),     # shoulder_pan_joint
+        (-1.5708, 1.5708),   # shoulder_lift_joint
+        (-2.3562, 2.3562),   # elbow_joint
+        (-2.3562, 2.3562),   # wrist_joint
     ]
+    names  = ['shoulder_pan', 'shoulder_lift', 'elbow', 'wrist']
     angles = [theta1, theta2, theta3, theta4]
-    for i, (angle, (lo, hi)) in enumerate(zip(angles, limits)):
+    ok = all(lo <= a <= hi for a, (lo, hi) in zip(angles, limits))
+
+    if not ok:
+        # Try elbow-down solution
+        theta3 = math.atan2(-math.sqrt(1.0 - D**2), D)
+        beta   = math.atan2(L2 * math.sin(theta3), L1 + L2 * math.cos(theta3))
+        theta2 = alpha - beta
+        theta4 = -(theta2 + theta3)
+        print(f'  [IK] Trying elbow-down: θ2={math.degrees(theta2):+.1f}°'
+              f'  θ3={math.degrees(theta3):+.1f}°  θ4={math.degrees(theta4):+.1f}°')
+        angles = [theta1, theta2, theta3, theta4]
+
+    for angle, (lo, hi), name in zip(angles, limits, names):
         if not (lo <= angle <= hi):
-            print(f'  [IK] Joint {i+1} angle {math.degrees(angle):.1f}° out of limits [{math.degrees(lo):.1f}°, {math.degrees(hi):.1f}°]')
+            print(f'  [IK] {name}: {math.degrees(angle):.1f}° outside '
+                  f'[{math.degrees(lo):.1f}°, {math.degrees(hi):.1f}°]')
             return None
 
     return theta1, theta2, theta3, theta4
@@ -117,66 +149,69 @@ class ArmIKNode(Node):
     def __init__(self):
         super().__init__('arm_ik_node')
 
-        # Target position in base_link frame (metres)
-        # This example reaches forward-right and slightly above the base
+        # Default target — reachable position in front of the arm
+        # The arm's max horizontal reach = L1+L2+L3 = 0.625 m
+        # Keep wr = r-L3 <= L1+L2 = 0.45 m  →  r <= 0.625 m
         self.declare_parameter('target_x', 0.30)
-        self.declare_parameter('target_y', 0.20)
-        self.declare_parameter('target_z', 0.40)
+        self.declare_parameter('target_y', 0.0)
+        self.declare_parameter('target_z', 0.20)
 
         x = self.get_parameter('target_x').value
         y = self.get_parameter('target_y').value
         z = self.get_parameter('target_z').value
 
         self._arm_pub = self.create_publisher(
-            JointTrajectory,
-            '/arm_controller/joint_trajectory',
-            10
-        )
+            JointTrajectory, '/arm_controller/joint_trajectory', 10)
         self._gripper_pub = self.create_publisher(
-            JointTrajectory,
-            '/gripper_controller/joint_trajectory',
-            10
-        )
+            JointTrajectory, '/gripper_controller/joint_trajectory', 10)
+
+        # Detach the green cylinder immediately so it doesn't follow the arm
+        from std_msgs.msg import Empty
+        self._detach_pub = self.create_publisher(Empty, '/green/detach', 10)
 
         self.get_logger().info(
-            f'Solving IK for target: x={x:.3f}, y={y:.3f}, z={z:.3f} m'
-        )
+            f'Solving IK for target: x={x:.3f}, y={y:.3f}, z={z:.3f} m')
 
         result = solve_ik(x, y, z)
 
         if result is None:
             self.get_logger().error(
-                'Target position is unreachable! Check coordinates and joint limits.'
-            )
+                'Target is unreachable — check coordinates and joint limits.')
             return
 
         theta1, theta2, theta3, theta4 = result
 
-        self.get_logger().info('IK solution found:')
-        self.get_logger().info(f'  shoulder_pan_joint  (θ1): {math.degrees(theta1):+.2f}°  ({theta1:+.4f} rad)')
-        self.get_logger().info(f'  shoulder_lift_joint (θ2): {math.degrees(theta2):+.2f}°  ({theta2:+.4f} rad)')
-        self.get_logger().info(f'  elbow_joint         (θ3): {math.degrees(theta3):+.2f}°  ({theta3:+.4f} rad)')
-        self.get_logger().info(f'  wrist_joint         (θ4): {math.degrees(theta4):+.2f}°  ({theta4:+.4f} rad)')
-
-        # Verify forward kinematics
-        ee_x = (L1*math.cos(theta2) + L2*math.cos(theta2+theta3) + L3*math.cos(theta2+theta3+theta4)) * math.cos(theta1)
-        ee_y = (L1*math.cos(theta2) + L2*math.cos(theta2+theta3) + L3*math.cos(theta2+theta3+theta4)) * math.sin(theta1)
-        ee_z = D0 + L1*math.sin(theta2) + L2*math.sin(theta2+theta3) + L3*math.sin(theta2+theta3+theta4)
+        self.get_logger().info('IK solution:')
         self.get_logger().info(
-            f'FK verification → EE at: x={ee_x:.3f}, y={ee_y:.3f}, z={ee_z:.3f}'
-        )
+            f'  shoulder_pan  θ1 = {math.degrees(theta1):+7.2f}°  ({theta1:+.4f} rad)')
+        self.get_logger().info(
+            f'  shoulder_lift θ2 = {math.degrees(theta2):+7.2f}°  ({theta2:+.4f} rad)')
+        self.get_logger().info(
+            f'  elbow         θ3 = {math.degrees(theta3):+7.2f}°  ({theta3:+.4f} rad)')
+        self.get_logger().info(
+            f'  wrist         θ4 = {math.degrees(theta4):+7.2f}°  ({theta4:+.4f} rad)')
 
-        # Wait a moment for controllers to be ready, then publish
         self._angles = (theta1, theta2, theta3, theta4)
-        self._timer = self.create_timer(2.0, self._publish_trajectory)
+        self._publish_count = 0
+
+        # First detach the green object, then start publishing the trajectory
+        self._detach_timer = self.create_timer(0.5, self._detach_and_start)
+
+    def _detach_and_start(self):
+        """Publish detach once, then start trajectory publishing."""
+        self._detach_timer.cancel()
+        from std_msgs.msg import Empty
+        self._detach_pub.publish(Empty())
+        self.get_logger().info('Detached green cylinder.')
+        # Start publishing trajectory after a short delay
+        self._timer = self.create_timer(0.5, self._publish_trajectory)
 
     def _publish_trajectory(self):
-        """Publish once then cancel the timer."""
-        self._timer.cancel()
+        """Publish trajectory 3 times to ensure controller receives it."""
+        self._publish_count += 1
 
         theta1, theta2, theta3, theta4 = self._angles
 
-        # ── Arm trajectory ──────────────────────────────────────────────────
         arm_msg = JointTrajectory()
         arm_msg.joint_names = [
             'shoulder_pan_joint',
@@ -184,40 +219,48 @@ class ArmIKNode(Node):
             'elbow_joint',
             'wrist_joint',
         ]
-
-        point = JointTrajectoryPoint()
-        point.positions = [theta1, theta2, theta3, theta4]
-        point.velocities = [0.0, 0.0, 0.0, 0.0]
-        point.time_from_start = Duration(sec=3, nanosec=0)
-
-        arm_msg.points = [point]
+        pt = JointTrajectoryPoint()
+        pt.positions  = [theta1, theta2, theta3, theta4]
+        pt.velocities = [0.0, 0.0, 0.0, 0.0]
+        pt.time_from_start = Duration(sec=4, nanosec=0)
+        arm_msg.points = [pt]
         self._arm_pub.publish(arm_msg)
 
-        # ── Gripper — open for approach ─────────────────────────────────────
         gripper_msg = JointTrajectory()
         gripper_msg.joint_names = ['left_finger_joint', 'right_finger_joint']
-
-        gpoint = JointTrajectoryPoint()
-        gpoint.positions = [0.03, 0.03]   # open
-        gpoint.velocities = [0.0, 0.0]
-        gpoint.time_from_start = Duration(sec=3, nanosec=0)
-
-        gripper_msg.points = [gpoint]
+        gpt = JointTrajectoryPoint()
+        gpt.positions  = [0.03, 0.03]   # open gripper
+        gpt.velocities = [0.0, 0.0]
+        gpt.time_from_start = Duration(sec=2, nanosec=0)
+        gripper_msg.points = [gpt]
         self._gripper_pub.publish(gripper_msg)
 
         self.get_logger().info(
-            'Trajectory published to /arm_controller/joint_trajectory '
-            'and /gripper_controller/joint_trajectory'
-        )
-        self.get_logger().info('Arm is moving to target position...')
+            f'Trajectory sent (attempt {self._publish_count}/3)')
+
+        if self._publish_count >= 3:
+            self._timer.cancel()
+            self.get_logger().info(
+                'Arm moving to target — motion completes in ~4 seconds.')
+            self._done_timer = self.create_timer(6.0, self._shutdown)
+
+    def _shutdown(self):
+        self._done_timer.cancel()
+        self.get_logger().info('Motion complete. Shutting down.')
+        raise SystemExit
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = ArmIKNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except SystemExit:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
